@@ -446,7 +446,6 @@ int ha_ldb::write_row(uchar *buf)
 
   trx_t *trx= (trx_t*)thd_get_ha_data(current_thd, ldb_hton);
   trx->batch.Put(key, value);
-  //fprintf(stderr, "trx:%p line %d\n", trx, __LINE__);
 
   DBUG_RETURN(0);
 }
@@ -479,7 +478,6 @@ int ha_ldb::update_row(const uchar *old_data, uchar *new_data)
 
   DBUG_ENTER("ha_ldb::update_row");
 
- // fprintf(stderr, "%d  %p\n",  __LINE__, this);
   std::string old_key;
   std::string new_key;
 
@@ -528,7 +526,6 @@ int ha_ldb::delete_row(const uchar *buf)
 
   trx_t *trx= (trx_t*)thd_get_ha_data(current_thd, ldb_hton);
   trx->batch.Delete(key);
-//  fprintf(stderr, "trx:%p line %d\n", trx, __LINE__);
 
   DBUG_RETURN(0);
 }
@@ -575,7 +572,6 @@ int ha_ldb::index_next(uchar *buf)
 {
   DBUG_ENTER("ha_ldb::index_next");
   table->status= STATUS_NOT_FOUND;
-//  fprintf(stderr, "%d  %p\n",  __LINE__, this);
   DBUG_RETURN(HA_ERR_END_OF_FILE);
 }
 
@@ -873,7 +869,6 @@ int ha_ldb::external_lock(THD *thd, int lock_type)
   if (lock_type != F_UNLCK)
   {
     trx= (trx_t*) thd_get_ha_data(thd, ldb_hton);
-//    fprintf(stderr, "trx:%p line %d\n", trx, __LINE__);
     if (!trx)
     {
       trx= new trx_t;
@@ -885,11 +880,9 @@ int ha_ldb::external_lock(THD *thd, int lock_type)
   else
   {
     trx= (trx_t*) thd_get_ha_data(thd, ldb_hton);
-//    fprintf(stderr, "trx:%p line %d\n", trx, __LINE__);
 
     if (!trx)
     {
-      fprintf(stderr, "NULL\n");
       DBUG_RETURN(1);
     }
  
@@ -998,7 +991,6 @@ int ha_ldb::delete_table(const char *name)
   DBUG_ENTER("ha_ldb::delete_table");
   /* This is not implemented but we want someone to be able that it works. */
   dbpath.assign(name);
-  //fprintf(stderr, "DESTROY--------------\n");
   leveldb::DestroyDB(dbpath, leveldb::Options());
   DBUG_RETURN(0);
 }
