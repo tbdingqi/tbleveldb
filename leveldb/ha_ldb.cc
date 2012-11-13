@@ -1080,7 +1080,7 @@ int ha_ldb::create(const char *name, TABLE *table_arg,
     works.
   */
 
-  if (table_arg->s->key_parts != 1)
+  if (table_arg->s->key_parts != 1 || table_arg->s->uniques != 1)
   {
     DBUG_RETURN(my_errno= HA_ERR_WRONG_INDEX);
   }
