@@ -1,0 +1,25 @@
+DARGS=""
+cp ldb_Makefile ldb_Makefile.tmp
+while getopts "crvd" arg
+do
+case $arg in
+             d)
+				sed -i "9s/OPT/# OPT/" ldb_Makefile.tmp
+				sed -i "10s/# OPT/OPT/" ldb_Makefile.tmp
+                ;;
+             ?)
+            echo "unkonw argument"
+        exit 1
+        ;;
+        esac
+done
+
+tar zxf leveldb-*.tar.gz
+mv leveldb-*.0 leveldb
+cp ldb_Makefile.tmp leveldb/Makefile
+chmod +x ldb_build_detect_platform
+cp ldb_build_detect_platform leveldb/build_detect_platform
+rm -rf ldb_Makefile.tmp
+cd leveldb
+make -j8
+
