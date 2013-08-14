@@ -43,8 +43,10 @@
 #include "thr_lock.h"                    /* THR_LOCK, THR_LOCK_DATA */
 #include "handler.h"                     /* handler */
 #include "my_base.h"                     /* ha_rows */
-#include "db.h"
+#include "leveldb/db.h"
 #include "leveldb/write_batch.h"
+#include "leveldb/iterator.h"
+#include "leveldb/env.h"
 
 #define LDB_MAX_KEY_LENGTH 3500 // Same as innodb
 /** @brief
@@ -64,6 +66,7 @@ typedef struct st_ldb_share {
 typedef struct st_trx_t{
   ha_ldb *pobj;
   leveldb::WriteBatch batch;
+  leveldb::Iterator* iter;
 }trx_t;
 
 leveldb::Status leveldb_open(const char *name, bool create_if_missing, leveldb::DB* &db);
@@ -76,7 +79,7 @@ class ha_ldb: public handler
 
   std::string dbpath;    
   THD *thd;
-  void get_key(uchar* buf, std::string &key);
+  std::string get_key(uchar* buf);
 public:
   LEVELDB_SHARE *share;    ///< Shared lock info
 

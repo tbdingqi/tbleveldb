@@ -98,6 +98,81 @@
 #include "probes_mysql.h"
 #include "sql_plugin.h"
 
+#include <string.h>
+
+uchar* encode_var_int(int a, uchar* buf) {
+  uchar* end = buf + sizeof(a);
+  uchar* p = buf;
+  for (; p < end; p++) {
+    *p = *(uchar*) &a;
+    if (a > 127)
+      *p |= 0x80;
+    else
+      break;
+    a = a >> 7;
+  }
+  return p + 1;
+}
+
+uchar* decode_var_int(uchar* var, int& result) {
+  result = 0;
+  for (unsigned int i = 0; i < sizeof(int); i++) {
+    if (var[i] <= 127) {
+      result += var[i] << (7 * i);
+      return var + i;
+    }
+    else {
+      result += (var[i] & 0x7F) << (7 * i);
+    }
+  }
+  return NULL;
+}
+
+static int cs_compress(uchar* buf, const size_t length) {
+  int zero_count = 0;
+  uchar tmp_buf[length + 6];
+  uchar* tmp_p = tmp_buf;
+  size_t cmp_length = 0;
+  for (uchar* p = buf; p < buf + length; p++) {
+    if (*p == 0) {
+      zero_count++;
+    }
+    else {
+      if (zero_count > 0) {
+        *tmp_p++ = 0;
+        tmp_p = encode_var_int(zero_count, tmp_p);
+        zero_count = 0;
+      }
+      *tmp_p++ = *p;
+    }
+    cmp_length = tmp_p - tmp_buf;
+    if (cmp_length > length)
+      return length;
+  }
+  memcpy(buf, tmp_buf, cmp_length);
+  return cmp_length;
+}
+
+static void cs_decompress(uchar* buf, size_t length, size_t decompress_length) {
+  uchar tmp_buf[decompress_length];
+  memset(tmp_buf, 0, decompress_length);
+  uchar* tmp_p = tmp_buf;
+  int zero_count = 0;
+  for (uchar* p = buf; p < buf + length; p++) {
+    if (*p == 0) {
+      p++;
+      p = decode_var_int(p, zero_count);
+      memset(tmp_p, 0, zero_count);
+      tmp_p += zero_count;
+    }
+    else {
+      *tmp_p = *p;
+      tmp_p++;
+    }
+  }
+  memcpy(buf, tmp_buf, tmp_p - tmp_buf);
+}
+
 
 static handler *ldb_create_handler(handlerton *hton,
                                        TABLE_SHARE *table, 
@@ -167,7 +242,6 @@ static int ldb_done_func(void *p)
   DBUG_RETURN(error);
 }
 
-
 /**
   @brief
   Example of simple lock controls. The "share" it creates is a
@@ -199,7 +273,7 @@ static LEVELDB_SHARE *get_share(const char *table_name, TABLE *table)
       return NULL;
     }
 
-    leveldb::Status s= leveldb_open(table_name, false, share->db);
+    leveldb::Status s= leveldb_open(table_name, true, share->db);
 
     share->use_count=0;
     share->table_name_length=length;
@@ -245,6 +319,31 @@ static int free_share(LEVELDB_SHARE *share)
   mysql_mutex_unlock(&ldb_mutex);
 
   return 0;
+}
+
+static int free_share_by_name(const char* table_name){
+  DBUG_ENTER("free_share_by_name");
+  LEVELDB_SHARE *share;
+  uint length;
+  mysql_mutex_lock(&ldb_mutex);
+  length=(uint) strlen(table_name);
+  share=(LEVELDB_SHARE*) my_hash_search(&ldb_open_tables, (uchar*) table_name, length);
+  
+  if(share!=NULL) {
+    if (!--share->use_count)
+    {
+      delete share->db;
+      share->db= NULL;
+      my_hash_delete(&ldb_open_tables, (uchar*) share);
+      thr_lock_delete(&share->lock);
+      mysql_mutex_destroy(&share->mutex);
+      my_free(share);
+    }
+    mysql_mutex_unlock(&ldb_mutex);
+    DBUG_RETURN(0);
+  }
+  mysql_mutex_unlock(&ldb_mutex);
+  DBUG_RETURN(1);
 }
 
 static handler* ldb_create_handler(handlerton *hton,
@@ -411,7 +510,7 @@ int ha_ldb::close(void)
   sql_insert.cc, sql_select.cc, sql_table.cc, sql_udf.cc and sql_update.cc
 */
 
-void ha_ldb::get_key(uchar *buf, std::string &key)
+std::string ha_ldb::get_key(uchar *buf)
 {
   KEY_PART_INFO *key_part= table->key_info[0].key_part;
   int bit_start= 0;
@@ -420,8 +519,8 @@ void ha_ldb::get_key(uchar *buf, std::string &key)
     bit_start= 1;
   if (key_part->type == HA_KEYTYPE_VARTEXT2 || key_part->type == HA_KEYTYPE_VARBINARY2)
     bit_start= 2;
-
-  key.append((char*)buf+key_part->offset+bit_start, key_part->length);
+  //copy to string before buf is compressed
+  return std::string((char*)buf+key_part->offset+bit_start, key_part->length);
  
 }
 
@@ -429,21 +528,13 @@ int ha_ldb::write_row(uchar *buf)
 {
   DBUG_ENTER("ha_ldb::write_row");
 
-  std::string key;
-  std::string value;
-
-  get_key(buf, key);
-
+  leveldb::Slice key = get_key(buf);
+  
   size_t raw_len= table->s->rec_buff_length;
-  size_t compressed_len= 0;
-
-  if (my_compress(buf, &raw_len, &compressed_len))
-  {
-    compressed_len= raw_len;
-  }
-
-  value.append((char*)buf, raw_len);
-
+  size_t compressed_len= 0;  
+  compressed_len = cs_compress(buf, raw_len);
+  leveldb::Slice value((char*)buf, compressed_len);
+  
   trx_t *trx= (trx_t*)thd_get_ha_data(current_thd, ldb_hton);
   trx->batch.Put(key, value);
 
@@ -478,16 +569,12 @@ int ha_ldb::update_row(const uchar *old_data, uchar *new_data)
 
   DBUG_ENTER("ha_ldb::update_row");
 
-  std::string old_key;
-  std::string new_key;
-
-  get_key((uchar*) old_data, old_key);
-  get_key((uchar*) new_data, new_key);
+  leveldb::Slice old_key = get_key((uchar*) old_data);
+  leveldb::Slice new_key = get_key((uchar*) new_data);
   
-  trx_t *trx= (trx_t*)thd_get_ha_data(current_thd, ldb_hton);
-
   if (old_key.compare(new_key) != 0)
   {
+    trx_t *trx= (trx_t*)thd_get_ha_data(current_thd, ldb_hton);
     trx->batch.Delete(old_key);
   }
 
@@ -520,10 +607,9 @@ int ha_ldb::update_row(const uchar *old_data, uchar *new_data)
 int ha_ldb::delete_row(const uchar *buf)
 {
   DBUG_ENTER("ha_ldb::delete_row");
-
-  std::string key;
-  get_key((uchar*)buf, key);
-
+  
+  leveldb::Slice key = get_key((uchar*)buf);
+  
   trx_t *trx= (trx_t*)thd_get_ha_data(current_thd, ldb_hton);
   trx->batch.Delete(key);
 
@@ -553,10 +639,8 @@ int ha_ldb::index_read(uchar *buf, const uchar *key, uint key_len, ha_rkey_funct
 
   memcpy(buf, svalue.c_str(), svalue.length());
 
-  size_t uncomlen= table->s->rec_buff_length;
   size_t comlen= svalue.length();
-  my_uncompress(buf, comlen, &uncomlen);
-  
+  cs_decompress(buf, comlen, table->s->rec_buff_length);
 
   table->status= 0;
   DBUG_RETURN(0);
@@ -650,7 +734,10 @@ int ha_ldb::index_last(uchar *buf)
 int ha_ldb::rnd_init(bool scan)
 {
   DBUG_ENTER("ha_ldb::rnd_init");
-  DBUG_RETURN(HA_ERR_WRONG_COMMAND);
+  trx_t *trx= (trx_t*)thd_get_ha_data(current_thd, ldb_hton);
+  trx->iter = trx->pobj->share->db->NewIterator(leveldb::ReadOptions());
+  trx->iter->SeekToFirst();
+  DBUG_RETURN(0);
 }
 
 int ha_ldb::rnd_end()
@@ -677,7 +764,25 @@ int ha_ldb::rnd_end()
 int ha_ldb::rnd_next(uchar *buf)
 {
   DBUG_ENTER("ha_ldb::rnd_next");
-  DBUG_RETURN(HA_ERR_WRONG_COMMAND);
+  trx_t* trx = (trx_t*) thd_get_ha_data(current_thd, ldb_hton);
+  leveldb::Iterator* iter = trx->iter;
+  if(iter->Valid())
+  {
+    leveldb::Slice value = iter->value();
+    leveldb::Slice key = iter->key();
+	memset(buf, 0, table->s->reclength);
+	
+	//decompress value
+    size_t value_length = value.size();
+	memcpy(buf, value.data(), value_length);
+	size_t uncomlen= table->s->rec_buff_length;
+    cs_decompress(buf, value_length, uncomlen);
+	
+    iter->Next();
+	DBUG_RETURN(0);
+  }
+  delete iter;
+  DBUG_RETURN(HA_ERR_END_OF_FILE);
 }
 
 
@@ -991,7 +1096,8 @@ int ha_ldb::delete_table(const char *name)
   DBUG_ENTER("ha_ldb::delete_table");
   /* This is not implemented but we want someone to be able that it works. */
   dbpath.assign(name);
-  leveldb::DestroyDB(dbpath, leveldb::Options());
+  free_share_by_name(name);
+  leveldb::Status s = leveldb::DestroyDB(dbpath, leveldb::Options());
   DBUG_RETURN(0);
 }
 
@@ -1046,6 +1152,10 @@ leveldb::Status leveldb_open(const char *name, bool create_if_missing, leveldb::
   dbpath.assign(name);
   options.write_buffer_size= 33554432;
   options.create_if_missing= create_if_missing;
+  
+  leveldb::Env* env = options.env;
+  env->DeleteDir(name);  // Ignore error in case dir contains other files  
+  
   status = leveldb::DB::Open(options, dbpath, &db);
   wo.sync= true;
 
@@ -1080,17 +1190,15 @@ int ha_ldb::create(const char *name, TABLE *table_arg,
     works.
   */
 
-  if (table_arg->s->key_parts != 1 || table_arg->s->max_unique_length != 1)
+  if (table_arg->s->key_parts != 1 || table_arg->s->max_unique_length == 0)
   {
     DBUG_RETURN(my_errno= HA_ERR_WRONG_INDEX);
   }
-
-  leveldb::DB* db= NULL;
-  leveldb::Status s;
-
   dbpath.assign(name);
-  s= leveldb_open(name, true, db);
-  DBUG_RETURN(!s.ok());
+  share = get_share(name, NULL);
+  if(share->db == NULL)
+    DBUG_RETURN(1);
+  DBUG_RETURN(0);
 }
 
 struct st_mysql_storage_engine ldb_storage_engine=
